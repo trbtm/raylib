@@ -62,8 +62,8 @@
 *   #define SUPPORT_BUSY_WAIT_LOOP
 *       Use busy wait loop for timing sync, if not defined, a high-resolution timer is setup and used
 *
-*   #define SUPPORT_HALFBUSY_WAIT_LOOP
-*       Use a half-busy wait loop, in this case frame sleeps for some time and runs a busy-wait-loop at the end
+*   #define SUPPORT_PARTIALBUSY_WAIT_LOOP
+*       Use a partial-busy wait loop, in this case frame sleeps for most of the time and runs a busy-wait-loop at the end
 *
 *   #define SUPPORT_EVENTS_WAITING
 *       Wait for events passively (sleeping while no events) instead of polling them actively every frame
@@ -116,8 +116,6 @@
 // Check if config flags have been externally provided on compilation line
 #if !defined(EXTERNAL_CONFIG_FLAGS)
     #include "config.h"             // Defines module configuration flags
-#else
-    #define RAYLIB_VERSION  "3.7"
 #endif
 
 #include "utils.h"                  // Required for: TRACELOG macros
@@ -225,8 +223,8 @@
     #include <android/window.h>             // Defines AWINDOW_FLAG_FULLSCREEN and others
     #include <android_native_app_glue.h>    // Defines basic app state struct and manages activity
 
-    #include <EGL/egl.h>                    // EGL library - Native platform display device control functions
-    #include <GLES2/gl2.h>                  // OpenGL ES 2.0 library
+    #include <EGL/egl.h>                    // Native platform windowing system interface
+    //#include <GLES2/gl2.h>                // OpenGL ES 2.0 library (not required in this module)
 #endif
 
 #if defined(PLATFORM_RPI) || defined(PLATFORM_DRM)
@@ -251,15 +249,15 @@
     #include <xf86drmMode.h>            // Direct Rendering Manager modesetting interface
 #endif
 
-    #include "EGL/egl.h"                // EGL library - Native platform display device control functions
-    #include "EGL/eglext.h"             // EGL library - Extensions
-    #include "GLES2/gl2.h"              // OpenGL ES 2.0 library
+    #include "EGL/egl.h"                // Native platform windowing system interface
+    #include "EGL/eglext.h"             // EGL extensions
+    //#include "GLES2/gl2.h"            // OpenGL ES 2.0 library (not required in this module)
 #endif
 
 #if defined(PLATFORM_UWP)
-    #include "EGL/egl.h"                // EGL library - Native platform display device control functions
-    #include "EGL/eglext.h"             // EGL library - Extensions
-    #include "GLES2/gl2.h"              // OpenGL ES 2.0 library
+    #include "EGL/egl.h"                // Native platform windowing system interface
+    #include "EGL/eglext.h"             // EGL extensions
+    //#include "GLES2/gl2.h"            // OpenGL ES 2.0 library (not required in this module)
     #include "uwp_events.h"             // UWP bootstrapping functions
 #endif
 
@@ -440,12 +438,12 @@ typedef struct CoreData {
             bool cursorHidden;              // Track if cursor is hidden
             bool cursorOnScreen;            // Tracks if cursor is inside client area
 
-            char currentButtonState[3];     // Registers current mouse button state
-            char previousButtonState[3];    // Registers previous mouse button state
+            char currentButtonState[MOUSE_BUTTON_MAX];     // Registers current mouse button state
+            char previousButtonState[MOUSE_BUTTON_MAX];    // Registers previous mouse button state
             float currentWheelMove;         // Registers current mouse wheel variation
             float previousWheelMove;        // Registers previous mouse wheel variation
 #if defined(PLATFORM_RPI) || defined(PLATFORM_DRM)
-            char currentButtonStateEvdev[3];    // Holds the new mouse state for the next polling event to grab (Can't be written directly due to multithreading, app could miss the update)
+            char currentButtonStateEvdev[MOUSE_BUTTON_MAX];    // Holds the new mouse state for the next polling event to grab (Can't be written directly due to multithreading, app could miss the update)
 #endif
         } Mouse;
         struct {
@@ -513,7 +511,7 @@ extern void UnloadFontDefault(void);        // [Module: text] Unloads default fo
 static bool InitGraphicsDevice(int width, int height);  // Initialize graphics device
 static void SetupFramebuffer(int width, int height);    // Setup main framebuffer
 static void SetupViewport(int width, int height);       // Set viewport for a provided width and height
-static void SwapBuffers(void);                          // Copy back buffer to front buffers
+static void SwapBuffers(void);                          // Copy back buffer to front buffer
 
 static void InitTimer(void);                            // Initialize timer
 static void Wait(float ms);                             // Wait for some milliseconds (stop program execution)
@@ -921,6 +919,7 @@ void CloseWindow(void)
     if (CORE.Input.Gamepad.threadId) pthread_join(CORE.Input.Gamepad.threadId, NULL);
 #endif
 
+    CORE.Window.ready = false;
     TRACELOG(LOG_INFO, "Window closed successfully");
 }
 
@@ -1040,7 +1039,7 @@ void ToggleFullscreen(void)
         GLFWmonitor** monitors = glfwGetMonitors(&monitorCount);
 
         int monitorIndex = GetCurrentMonitor();
-        
+
         // Use current monitor, so we correctly get the display the window is on
         GLFWmonitor* monitor = monitorIndex < monitorCount ?  monitors[monitorIndex] : NULL;
 
@@ -1089,7 +1088,7 @@ void ToggleFullscreen(void)
         // Option 1: Request fullscreen for the canvas element
         // This option does not seem to work at all
         //emscripten_request_fullscreen("#canvas", false);
-        
+
         // Option 2: Request fullscreen for the canvas element with strategy
         // This option does not seem to work at all
         // Ref: https://github.com/emscripten-core/emscripten/issues/5124
@@ -1101,8 +1100,8 @@ void ToggleFullscreen(void)
             // .canvasResizedCallbackUserData = NULL
         // };
         //emscripten_request_fullscreen_strategy("#canvas", EM_FALSE, &strategy);
-        
-        // Option 3: Request fullscreen for the canvas element with strategy 
+
+        // Option 3: Request fullscreen for the canvas element with strategy
         // It works as expected but only inside the browser (client area)
         EmscriptenFullscreenStrategy strategy = {
             .scaleMode = EMSCRIPTEN_FULLSCREEN_SCALE_ASPECT,
@@ -1121,10 +1120,10 @@ void ToggleFullscreen(void)
     {
         //emscripten_exit_fullscreen();
         emscripten_exit_soft_fullscreen();
-        
+
         int width, height;
         emscripten_get_canvas_element_size("#canvas", &width, &height);
-        TRACELOG(LOG_WARNING, "Emscripten: Exit fullscreen: Canvas size: %i x %i", width, height);  
+        TRACELOG(LOG_WARNING, "Emscripten: Exit fullscreen: Canvas size: %i x %i", width, height);
     }
 */
 
@@ -2070,7 +2069,7 @@ void EndScissorMode(void)
 void BeginVrStereoMode(VrStereoConfig config)
 {
     rlEnableStereoRender();
-    
+
     // Set stereo render matrices
     rlSetMatrixProjectionStereo(config.projection[0], config.projection[1]);
     rlSetMatrixViewOffsetStereo(config.viewOffset[0], config.viewOffset[1]);
@@ -2086,7 +2085,7 @@ void EndVrStereoMode(void)
 VrStereoConfig LoadVrStereoConfig(VrDeviceInfo device)
 {
     VrStereoConfig config = { 0 };
-    
+
 #if defined(GRAPHICS_API_OPENGL_33) || defined(GRAPHICS_API_OPENGL_ES2)
     // Compute aspect ratio
     float aspect = ((float)device.hResolution*0.5f)/(float)device.vResolution;
@@ -2126,7 +2125,7 @@ VrStereoConfig LoadVrStereoConfig(VrDeviceInfo device)
     // Compute camera projection matrices
     float projOffset = 4.0f*lensShift;      // Scaled to projection space coordinates [-1..1]
     Matrix proj = MatrixPerspective(fovy, aspect, RL_CULL_DISTANCE_NEAR, RL_CULL_DISTANCE_FAR);
-    
+
     config.projection[0] = MatrixMultiply(proj, MatrixTranslate(projOffset, 0.0f, 0.0f));
     config.projection[1] = MatrixMultiply(proj, MatrixTranslate(-projOffset, 0.0f, 0.0f));
 
@@ -2156,7 +2155,7 @@ VrStereoConfig LoadVrStereoConfig(VrDeviceInfo device)
     return config;
 }
 
-// Unload VR stereo config properties 
+// Unload VR stereo config properties
 void UnloadVrStereoConfig(VrStereoConfig config)
 {
     //...
@@ -2180,8 +2179,8 @@ Shader LoadShader(const char *vsFileName, const char *fsFileName)
 
     shader.id = rlLoadShaderCode(vShaderStr, fShaderStr);
 
-    if (vShaderStr != NULL) RL_FREE(vShaderStr);
-    if (fShaderStr != NULL) RL_FREE(fShaderStr);
+    if (vShaderStr != NULL) UnloadFileText(vShaderStr);
+    if (fShaderStr != NULL) UnloadFileText(fShaderStr);
 
     // After shader loading, we TRY to set default location names
     if (shader.id > 0)
@@ -2319,7 +2318,7 @@ void SetShaderValueTexture(Shader shader, int locIndex, Texture2D texture)
 // Returns a ray trace from mouse position
 Ray GetMouseRay(Vector2 mouse, Camera camera)
 {
-    Ray ray;
+    Ray ray = { 0 };
 
     // Calculate normalized device coordinates
     // NOTE: y value is negative
@@ -2808,8 +2807,8 @@ char **GetDirectoryFiles(const char *dirPath, int *fileCount)
     ClearDirectoryFiles();
 
     // Memory allocation for MAX_DIRECTORY_FILES
-    dirFilesPath = (char **)RL_MALLOC(sizeof(char *)*MAX_DIRECTORY_FILES);
-    for (int i = 0; i < MAX_DIRECTORY_FILES; i++) dirFilesPath[i] = (char *)RL_MALLOC(sizeof(char)*MAX_FILEPATH_LENGTH);
+    dirFilesPath = (char **)RL_MALLOC(MAX_DIRECTORY_FILES*sizeof(char *));
+    for (int i = 0; i < MAX_DIRECTORY_FILES; i++) dirFilesPath[i] = (char *)RL_MALLOC(MAX_FILEPATH_LENGTH*sizeof(char));
 
     int counter = 0;
     struct dirent *entity;
@@ -3776,12 +3775,6 @@ static bool InitGraphicsDevice(int width, int height)
     glfwSwapInterval(0);        // No V-Sync by default
 #endif
 
-#if defined(PLATFORM_DESKTOP)
-    // Load OpenGL 3.3 extensions
-    // NOTE: GLFW loader function is passed as parameter
-    rlLoadExtensions(glfwGetProcAddress);
-#endif
-
     // Try to enable GPU V-Sync, so frames are limited to screen refresh rate (60Hz -> 60 FPS)
     // NOTE: V-Sync can be enabled by graphic driver configuration
     if (CORE.Window.flags & FLAG_VSYNC_HINT)
@@ -3790,11 +3783,11 @@ static bool InitGraphicsDevice(int width, int height)
         glfwSwapInterval(1);
         TRACELOG(LOG_INFO, "DISPLAY: Trying to enable VSYNC");
     }
-#endif // PLATFORM_DESKTOP || PLATFORM_WEB
+#endif  // PLATFORM_DESKTOP || PLATFORM_WEB
 
 #if defined(PLATFORM_ANDROID) || defined(PLATFORM_RPI) || defined(PLATFORM_DRM) || defined(PLATFORM_UWP)
     CORE.Window.fullscreen = true;
-    CORE.Window.flags &= FLAG_FULLSCREEN_MODE;
+    CORE.Window.flags |= FLAG_FULLSCREEN_MODE;
 
 #if defined(PLATFORM_RPI)
     bcm_host_init();
@@ -3822,7 +3815,7 @@ static bool InitGraphicsDevice(int width, int height)
 #else
     TRACELOG(LOG_INFO, "DISPLAY: No graphic card set, trying card1");
     CORE.Window.fd = open("/dev/dri/card1", O_RDWR); // VideoCore VI (Raspberry Pi 4)
-    if (-1 == CORE.Window.fd)
+    if ((-1 == CORE.Window.fd) || (drmModeGetResources(CORE.Window.fd) == NULL))
     {
         TRACELOG(LOG_INFO, "DISPLAY: Failed to open graphic card1, trying card0");
         CORE.Window.fd = open("/dev/dri/card0", O_RDWR); // VideoCore IV (Raspberry Pi 1-3)
@@ -4361,7 +4354,15 @@ static bool InitGraphicsDevice(int width, int height)
         TRACELOG(LOG_INFO, "    > Screen size:  %i x %i", CORE.Window.screen.width, CORE.Window.screen.height);
         TRACELOG(LOG_INFO, "    > Viewport offsets: %i, %i", CORE.Window.renderOffset.x, CORE.Window.renderOffset.y);
     }
-#endif // PLATFORM_ANDROID || PLATFORM_RPI || PLATFORM_DRM || PLATFORM_UWP
+#endif  // PLATFORM_ANDROID || PLATFORM_RPI || PLATFORM_DRM || PLATFORM_UWP
+
+    // Load OpenGL extensions
+    // NOTE: GL procedures address loader is required to load extensions
+#if defined(PLATFORM_DESKTOP) || defined(PLATFORM_WEB)
+    rlLoadExtensions(glfwGetProcAddress);
+#else
+    rlLoadExtensions(eglGetProcAddress);
+#endif
 
     // Initialize OpenGL context (states and resources)
     // NOTE: CORE.Window.screen.width and CORE.Window.screen.height not used, just stored as globals in rlgl
@@ -4524,7 +4525,7 @@ static void InitTimer(void)
 #endif
 
 #if defined(PLATFORM_ANDROID) || defined(PLATFORM_RPI) || defined(PLATFORM_DRM)
-    struct timespec now;
+    struct timespec now = { 0 };
 
     if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)  // Success
     {
@@ -4555,10 +4556,15 @@ static void Wait(float ms)
     // Busy wait loop
     while ((nextTime - prevTime) < ms/1000.0f) nextTime = GetTime();
 #else
-    #if defined(SUPPORT_HALFBUSY_WAIT_LOOP)
-        #define MAX_HALFBUSY_WAIT_TIME  4
+    #if defined(SUPPORT_PARTIALBUSY_WAIT_LOOP)
+        #define DEFAULT_PARTIALBUSY_WAIT_TIME   4
+        #define PARTIALBUSY_WAIT_FACTOR         0.95
+
+        double halfWait = DEFAULT_PARTIALBUSY_WAIT_TIME;
+        if (CORE.Time.target > 0) halfWait = CORE.Time.target*PARTIALBUSY_WAIT_FACTOR;
+
         double destTime = GetTime() + ms/1000;
-        if (ms > MAX_HALFBUSY_WAIT_TIME) ms -= MAX_HALFBUSY_WAIT_TIME;
+        if (ms > halfWait) ms -= (float)halfWait;
     #endif
 
     #if defined(_WIN32)
@@ -4578,7 +4584,7 @@ static void Wait(float ms)
         usleep(ms*1000.0f);
     #endif
 
-    #if defined(SUPPORT_HALFBUSY_WAIT_LOOP)
+    #if defined(SUPPORT_PARTIALBUSY_WAIT_LOOP)
         while (GetTime() < destTime) { }
     #endif
 #endif
@@ -4752,7 +4758,7 @@ static void PollInputEvents(void)
 #else
     glfwPollEvents();       // Register keyboard/mouse events (callbacks)... and window events!
 #endif
-#endif      //defined(PLATFORM_DESKTOP)
+#endif  // PLATFORM_DESKTOP
 
 // Gamepad support using emscripten API
 // NOTE: GLFW3 joystick functionality not available in web
@@ -4915,8 +4921,8 @@ static void SwapBuffers(void)
         gbm_surface_release_buffer(CORE.Window.gbmSurface, CORE.Window.prevBO);
     }
     CORE.Window.prevBO = bo;
-#endif // defined(PLATFORM_DRM)
-#endif // defined(PLATFORM_ANDROID) || defined(PLATFORM_RPI) || defined(PLATFORM_DRM) || defined(PLATFORM_UWP)
+#endif  // PLATFORM_DRM
+#endif  // PLATFORM_ANDROID || PLATFORM_RPI || PLATFORM_DRM || PLATFORM_UWP
 }
 
 #if defined(PLATFORM_DESKTOP) || defined(PLATFORM_WEB)
@@ -5151,11 +5157,11 @@ static void WindowDropCallback(GLFWwindow *window, int count, const char **paths
 {
     ClearDroppedFiles();
 
-    CORE.Window.dropFilesPath = (char **)RL_MALLOC(sizeof(char *)*count);
+    CORE.Window.dropFilesPath = (char **)RL_MALLOC(count*sizeof(char *));
 
     for (int i = 0; i < count; i++)
     {
-        CORE.Window.dropFilesPath[i] = (char *)RL_MALLOC(sizeof(char)*MAX_FILEPATH_LENGTH);
+        CORE.Window.dropFilesPath[i] = (char *)RL_MALLOC(MAX_FILEPATH_LENGTH*sizeof(char));
         strcpy(CORE.Window.dropFilesPath[i], paths[i]);
     }
 
@@ -5351,11 +5357,11 @@ static int32_t AndroidInputCallback(struct android_app *app, AInputEvent *event)
 
     if (flags == AMOTION_EVENT_ACTION_DOWN || flags == AMOTION_EVENT_ACTION_MOVE)
     {
-        CORE.Input.Touch.currentTouchState[MOUSE_LEFT_BUTTON] = 1;
+        CORE.Input.Touch.currentTouchState[MOUSE_BUTTON_LEFT] = 1;
     }
     else if (flags == AMOTION_EVENT_ACTION_UP)
     {
-        CORE.Input.Touch.currentTouchState[MOUSE_LEFT_BUTTON] = 0;
+        CORE.Input.Touch.currentTouchState[MOUSE_BUTTON_LEFT] = 0;
     }
 
 #if defined(SUPPORT_GESTURES_SYSTEM)
@@ -5660,7 +5666,7 @@ static void RestoreKeyboard(void)
     // Reconfigure keyboard to default mode
     ioctl(STDIN_FILENO, KDSKBMODE, CORE.Input.Keyboard.defaultMode);
 }
-#endif      //SUPPORT_SSH_KEYBOARD_RPI
+#endif  // SUPPORT_SSH_KEYBOARD_RPI
 
 // Initialise user input from evdev(/dev/input/event<N>) this means mouse, keyboard or gamepad devices
 static void InitEvdevInput(void)
@@ -6068,11 +6074,11 @@ static void *EventThread(void *arg)
                 // Touchscreen tap
                 if (event.code == ABS_PRESSURE)
                 {
-                    int previousMouseLeftButtonState = CORE.Input.Mouse.currentButtonStateEvdev[MOUSE_LEFT_BUTTON];
+                    int previousMouseLeftButtonState = CORE.Input.Mouse.currentButtonStateEvdev[MOUSE_BUTTON_LEFT];
 
                     if (!event.value && previousMouseLeftButtonState)
                     {
-                        CORE.Input.Mouse.currentButtonStateEvdev[MOUSE_LEFT_BUTTON] = 0;
+                        CORE.Input.Mouse.currentButtonStateEvdev[MOUSE_BUTTON_LEFT] = 0;
 
                         #if defined(SUPPORT_GESTURES_SYSTEM)
                             touchAction = TOUCH_UP;
@@ -6082,7 +6088,7 @@ static void *EventThread(void *arg)
 
                     if (event.value && !previousMouseLeftButtonState)
                     {
-                        CORE.Input.Mouse.currentButtonStateEvdev[MOUSE_LEFT_BUTTON] = 1;
+                        CORE.Input.Mouse.currentButtonStateEvdev[MOUSE_BUTTON_LEFT] = 1;
 
                         #if defined(SUPPORT_GESTURES_SYSTEM)
                             touchAction = TOUCH_DOWN;
@@ -6099,7 +6105,7 @@ static void *EventThread(void *arg)
                 // Mouse button parsing
                 if ((event.code == BTN_TOUCH) || (event.code == BTN_LEFT))
                 {
-                    CORE.Input.Mouse.currentButtonStateEvdev[MOUSE_LEFT_BUTTON] = event.value;
+                    CORE.Input.Mouse.currentButtonStateEvdev[MOUSE_BUTTON_LEFT] = event.value;
 
                     #if defined(SUPPORT_GESTURES_SYSTEM)
                         if (event.value > 0) touchAction = TOUCH_DOWN;
@@ -6108,8 +6114,12 @@ static void *EventThread(void *arg)
                     #endif
                 }
 
-                if (event.code == BTN_RIGHT) CORE.Input.Mouse.currentButtonStateEvdev[MOUSE_RIGHT_BUTTON] = event.value;
-                if (event.code == BTN_MIDDLE) CORE.Input.Mouse.currentButtonStateEvdev[MOUSE_MIDDLE_BUTTON] = event.value;
+                if (event.code == BTN_RIGHT) CORE.Input.Mouse.currentButtonStateEvdev[MOUSE_BUTTON_RIGHT] = event.value;
+                if (event.code == BTN_MIDDLE) CORE.Input.Mouse.currentButtonStateEvdev[MOUSE_BUTTON_MIDDLE] = event.value;
+                if (event.code == BTN_SIDE) CORE.Input.Mouse.currentButtonStateEvdev[MOUSE_BUTTON_SIDE] = event.value;
+                if (event.code == BTN_EXTRA) CORE.Input.Mouse.currentButtonStateEvdev[MOUSE_BUTTON_EXTRA] = event.value;
+                if (event.code == BTN_FORWARD) CORE.Input.Mouse.currentButtonStateEvdev[MOUSE_BUTTON_FORWARD] = event.value;
+                if (event.code == BTN_BACK) CORE.Input.Mouse.currentButtonStateEvdev[MOUSE_BUTTON_BACK] = event.value;
             }
 
             // Screen confinement
@@ -6244,7 +6254,7 @@ static void *GamepadThread(void *arg)
 
     return NULL;
 }
-#endif      // PLATFORM_RPI || PLATFORM_DRM
+#endif  // PLATFORM_RPI || PLATFORM_DRM
 
 #if defined(PLATFORM_UWP)
 // UWP function pointers
@@ -6516,7 +6526,7 @@ void UWPGestureTouch(int pointer, float x, float y, bool touch)
 #endif
 }
 
-#endif // PLATFORM_UWP
+#endif  // PLATFORM_UWP
 
 #if defined(PLATFORM_DRM)
 // Search matching DRM mode in connector's mode list
